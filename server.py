@@ -19,6 +19,20 @@ for p in [vms_path, disks_path, kernel_path]:
     if not os.path.exists(p):
         os.makedirs(p)
 
+
+def is_running(pid):
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    else:
+        return True
+
+
+def write_string(writer, message):
+    writer.write(f'{message}\n'.encode())
+
+
 async def handle_rpc(reader, writer):
     data = await reader.read()
     message = data.decode()
@@ -26,7 +40,6 @@ async def handle_rpc(reader, writer):
 
     print(f"Received {message!r} from {addr!r}")
     data = json.loads(message)
-    fuck_off = False
 
     async def close_writer():
         await writer.drain()
@@ -34,70 +47,85 @@ async def handle_rpc(reader, writer):
         await writer.wait_closed()
 
     if "action" not in data:
-        writer.write("No action defined.\n".encode())
+        write_string(writer, 'No action defined')
         await close_writer()
         return
 
     action = data['action'].strip()
+    data['action'] = action
     if not data.get("vm_name") and action in ['start', 'stop', 'kill', 'address']:
-        writer.write("No vm name given.\n".encode())
+        write_string(writer, 'No VM name is given')
         await close_writer()
         return
 
     vm_name = data.get('vm_name', '').strip()
+    data['vm_name'] = vm_name
 
     def validate():
         if action in ['stop', 'address', 'kill']:
             if vm_name not in DATA:
-                return False, f'No such VM {vm_name} is running\n'.encode()
-
-        if action == "list" and not DATA:
-            return False, 'No running VMs.\n'.encode()
+                return False, f'No such VM {vm_name} is running'
 
         elif action == 'start':
             if vm_name in DATA:
-                return False, f'VM {vm_name} is already started.\n'.encode()
+                return False, f'VM {vm_name} is already started'
 
         return True, None
 
     valid, msg = validate()
     if not valid:
-        writer.write(msg)
+        write_string(writer, msg)
         await close_writer()
         return
 
-    if action == "start":
-        cpu = data['cpu']
-        memory = data['memory']
-        writer.write(f"Staring VM {vm_name}\n".encode())
-        ret = await handle_start(vm_name, cpu, memory)
-        writer.write(ret.encode())
+    actions = {}
+    actions['start'] = handle_start
+    actions['stop'] = handle_stop
+    actions['kill'] = handle_stop
+    actions['available'] = handle_available
+    actions['address'] = handle_address
+    actions['list'] = handle_list
 
-    elif action in ["stop", "kill"]:
-        writer.write(f'Attempting to {action} VM {vm_name}\n'.encode())
-        await handle_stop(vm_name, action)
-        writer.write(f'Done {action} VM {vm_name}\n'.encode())
-    elif action == "list":
-        writer.write('Currently running VMs are:\n'.encode())
-        for vname in DATA.keys():
-            writer.write(f'\t{vname}\n'.encode())
-    elif action == "available":
-        writer.write('Available VMs:\n'.encode())
-        for vm in os.listdir(vms_path):
-            if 'shadow' not in vm:
-                continue
-            writer.write(f'\t{os.path.splitext(vm)[0]}\n'.encode())
-    elif action == "address":
-        ip = await handle_address(vm_name)
-        if ip is None:
-            writer.write(f'No IP can be determined. Try a bit later...\n'.encode())
-        else:
-            writer.write(f'VM {vm_name} ip is {ip}\n'.encode())
+    await actions[action](writer, data)
 
     await close_writer()
 
 
-async def handle_start(vm_name, cpu, memory):
+async def handle_list(writer, data):
+    for vm_name in list(DATA):
+        vm, _ = DATA[vm_name]
+
+        if not is_running(vm.pid):
+            del DATA[vm_name]
+
+    if not DATA:
+        write_string(writer, 'No running VMs')
+        return
+
+    write_string(writer, 'Currently running VMs are:')
+
+    for vm_name in DATA.keys():
+        write_string(writer, f'\t{vm_name}')
+
+
+async def handle_available(writer, data):
+    write_string(writer, 'Available VMs:')
+
+    for vm in os.listdir(vms_path):
+        name, ext = os.path.splitext(vm)
+
+        if ext != '.shadow':
+            continue
+        write_string(writer, f'\t{name}')
+
+
+async def handle_start(writer, data):
+    vm_name = data['vm_name']
+    cpu = data['cpu']
+    memory = data['memory']
+
+    write_string(writer, f'Starting VM {vm_name}\n')
+
     attach_disk = await asyncio.create_subprocess_shell(
         f'hdiutil attach -nomount -noverify -noautofsck -shadow {data_path}/vms/{vm_name}.shadow {data_path}/disks/centos.dmg | head -n1 | cut -f1 -d " "',
         stdout=asyncio.subprocess.PIPE,
@@ -108,6 +136,7 @@ async def handle_start(vm_name, cpu, memory):
         disk = stdout.decode().strip()
     if stderr:
         print(f'[stderr]\n{stderr.decode()}')
+        write_string(writer, 'There was an error whilst attaching an image')
         return
 
     rdisk = disk.replace("disk", "rdisk")
@@ -131,16 +160,27 @@ async def handle_start(vm_name, cpu, memory):
     )
     DATA[vm_name] = (vm, disk)
 
-    return f'VM {vm_name} started'
+    write_string(writer, f'VM {vm_name} started')
 
 
-async def handle_stop(vm_name, action):
+async def handle_stop(writer, data):
+    vm_name = data['vm_name']
+    action = data['action']
     vm, disk = DATA[vm_name]
 
-    if action == "stop":
-        vm.terminate()
-    elif action == "kill":
-        vm.kill()
+    if not is_running(vm.pid):
+        write_string(writer, f'VM {vm_name} is already stopped')
+        if vm_name in DATA:
+            del DATA[vm_name]
+        return
+
+    actions = {}
+    actions['stop'] = vm.terminate
+    actions['kill'] = vm.kill
+
+    write_string(writer, f'Attempting to {action} VM {vm_name}')
+
+    actions[action]()
 
     await vm.wait()
 
@@ -156,24 +196,37 @@ async def handle_stop(vm_name, action):
         print(f'[stdout]\n{stdout.decode()}')
     if stderr:
         print(f'[stderr]\n{stderr.decode()}')
+        write_string(writer, f'Error occured whilst detaching VM\'s disk {vm_name}')
+        write_string(writer, 'Please check server logs')
+
+    write_string(writer, f'VM {vm_name} is stopped')
 
 
-async def handle_address(vm_name):
-    tries = 10
-    while tries > 0:
-        async with aiofiles.open(f'/tmp/stdin_{vm_name}', mode='w') as f:
-            await f.write("ip a | grep 'scope global' | grep --color=never -Po '(?<=inet )[\d.]+'\n")
-            await f.flush()
-        async with aiofiles.open(f'/tmp/stdout_{vm_name}', mode='r') as f:
-            async for line in f:
-                try:
-                    return ipaddress.ip_address(line.strip())
-                except ValueError:
-                    pass
-        await asyncio.sleep(1)
-        tries -= 1
-    return None
+async def handle_address(writer, data):
+    vm_name = data['vm_name']
 
+    async def get_ip():
+        tries = 10
+        while tries > 0:
+            async with aiofiles.open(f'/tmp/stdin_{vm_name}', mode='w') as f:
+                await f.write("ip a | grep 'scope global' | grep --color=never -Po '(?<=inet )[\d.]+'\n")
+                await f.flush()
+            async with aiofiles.open(f'/tmp/stdout_{vm_name}', mode='r') as f:
+                async for line in f:
+                    try:
+                        return ipaddress.ip_address(line.strip())
+                    except ValueError:
+                        pass
+            await asyncio.sleep(1)
+            tries -= 1
+        return None
+
+    ip = await get_ip()
+    if ip is None:
+        write_string(writer, 'No IP can be determined. Try a bit later...')
+        return
+
+    write_string(writer, f'VM {vm_name} IP is {ip}')
 
 async def main():
     server = await asyncio.start_server(
