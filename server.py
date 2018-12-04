@@ -8,6 +8,8 @@ import sys
 
 import aiofiles
 
+data_lock = asyncio.Lock()
+
 DATA = {}
 
 data_path = os.path.dirname(sys.argv[0])
@@ -61,18 +63,17 @@ async def handle_rpc(reader, writer):
     vm_name = data.get('vm_name', '').strip()
     data['vm_name'] = vm_name
 
-    def validate():
-        if action in ['stop', 'address', 'kill']:
-            if vm_name not in DATA:
-                return False, f'No such VM {vm_name} is running'
-
-        elif action == 'start':
-            if vm_name in DATA:
-                return False, f'VM {vm_name} is already started'
-
+    async def validate():
+        async with data_lock:
+            if action in ['stop', 'address', 'kill']:
+                if vm_name not in DATA:
+                    return False, f'No such VM {vm_name} is running'
+            elif action == 'start':
+                if vm_name in DATA:
+                    return False, f'VM {vm_name} is already started'
         return True, None
 
-    valid, msg = validate()
+    valid, msg = await validate()
     if not valid:
         write_string(writer, msg)
         await close_writer()
@@ -92,20 +93,21 @@ async def handle_rpc(reader, writer):
 
 
 async def handle_list(writer, data):
-    for vm_name in list(DATA):
-        vm, _ = DATA[vm_name]
+    async with data_lock:
+        for vm_name in list(DATA):
+            vm, _ = DATA[vm_name]
 
-        if not is_running(vm.pid):
-            del DATA[vm_name]
+            if not is_running(vm.pid):
+                del DATA[vm_name]
 
-    if not DATA:
-        write_string(writer, 'No running VMs')
-        return
+        if not DATA:
+            write_string(writer, 'No running VMs')
+            return
 
-    write_string(writer, 'Currently running VMs are:')
+        write_string(writer, 'Currently running VMs are:')
 
-    for vm_name in DATA.keys():
-        write_string(writer, f'\t{vm_name}')
+        for vm_name in DATA.keys():
+            write_string(writer, f'\t{vm_name}')
 
 
 async def handle_available(writer, data):
@@ -158,7 +160,8 @@ async def handle_start(writer, data):
         stderr=asyncio.subprocess.DEVNULL,
         stdin=asyncio.subprocess.DEVNULL
     )
-    DATA[vm_name] = (vm, disk)
+    async with data_lock:
+        DATA[vm_name] = (vm, disk)
 
     write_string(writer, f'VM {vm_name} started')
 
@@ -166,40 +169,42 @@ async def handle_start(writer, data):
 async def handle_stop(writer, data):
     vm_name = data['vm_name']
     action = data['action']
-    vm, disk = DATA[vm_name]
 
-    if not is_running(vm.pid):
-        write_string(writer, f'VM {vm_name} is already stopped')
-        if vm_name in DATA:
-            del DATA[vm_name]
-        return
+    async with data_lock:
+        vm, disk = DATA[vm_name]
 
-    actions = {}
-    actions['stop'] = vm.terminate
-    actions['kill'] = vm.kill
+        if not is_running(vm.pid):
+            write_string(writer, f'VM {vm_name} is already stopped')
+            if vm_name in DATA:
+                del DATA[vm_name]
+            return
 
-    write_string(writer, f'Attempting to {action} VM {vm_name}')
+        actions = {}
+        actions['stop'] = vm.terminate
+        actions['kill'] = vm.kill
 
-    actions[action]()
+        write_string(writer, f'Attempting to {action} VM {vm_name}')
 
-    await vm.wait()
+        actions[action]()
 
-    del DATA[vm_name]
+        await vm.wait()
 
-    detach_disk = await asyncio.create_subprocess_shell(
-        f'hdiutil detach {disk}',
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
-    )
-    stdout, stderr = await detach_disk.communicate()
-    if stdout:
-        print(f'[stdout]\n{stdout.decode()}')
-    if stderr:
-        print(f'[stderr]\n{stderr.decode()}')
-        write_string(writer, f'Error occured whilst detaching VM\'s disk {vm_name}')
-        write_string(writer, 'Please check server logs')
+        del DATA[vm_name]
 
-    write_string(writer, f'VM {vm_name} is stopped')
+        detach_disk = await asyncio.create_subprocess_shell(
+            f'hdiutil detach {disk}',
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await detach_disk.communicate()
+        if stdout:
+            print(f'[stdout]\n{stdout.decode()}')
+        if stderr:
+            print(f'[stderr]\n{stderr.decode()}')
+            write_string(writer, f'Error occured whilst detaching VM\'s disk {vm_name}')
+            write_string(writer, 'Please check server logs')
+
+        write_string(writer, f'VM {vm_name} is stopped')
 
 
 async def handle_address(writer, data):
@@ -227,6 +232,7 @@ async def handle_address(writer, data):
         return
 
     write_string(writer, f'VM {vm_name} IP is {ip}')
+
 
 async def main():
     server = await asyncio.start_server(
