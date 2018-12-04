@@ -81,6 +81,12 @@ async def handle_rpc(reader, writer):
         writer.write('Currently running VMs are:\n'.encode())
         for vname in DATA.keys():
             writer.write(f'\t{vname}\n'.encode())
+    elif action == "available":
+        writer.write('Available VMs:\n'.encode())
+        for vm in os.listdir(vms_path):
+            if 'shadow' not in vm:
+                continue
+            writer.write(f'\t{os.path.splitext(vm)[0]}\n'.encode())
     elif action == "address":
         ip = await handle_address(vm_name)
         if ip is None:
@@ -126,6 +132,7 @@ async def handle_start(vm_name, cpu, memory):
     DATA[vm_name] = (vm, disk)
 
     return f'VM {vm_name} started'
+
 
 async def handle_stop(vm_name, action):
     vm, disk = DATA[vm_name]

@@ -4,7 +4,7 @@ import asyncio
 import json
 import sys
 
-ACTIONS = ['start', 'stop', 'kill', 'list', 'address']
+ACTIONS = ['start', 'stop', 'kill', 'list', 'address', 'available']
 
 parser = argparse.ArgumentParser(sys.argv[0])
 parser.add_argument('action', help=f'Action to perform ({"|".join(ACTIONS)})', type=str)
@@ -43,7 +43,7 @@ if action == "start":
         "memory": args.memory,
         "cpu": args.cpu
     }
-elif action == "list":
+elif action in ["list", "available"]:
     data = {"action": action}
 elif action in ["stop", "kill", "address"]:
     data = {"action": action, "vm_name": vm_name}
